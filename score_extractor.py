@@ -248,6 +248,52 @@ def compute_part_data(
     dark_nb         = dark_mask.copy()
     dark_nb[:, barline_cols] = False
 
+    # ── 1a. Crossing bar-line pixels ──────────────────────────────────────────
+    # Pixels in bar-line columns that belong to objects crossing the bar line
+    # (slurs, crescendos, ties) have non-bar-line dark content on BOTH sides.
+    # We must not white these out — they must remain continuous in the output.
+    #
+    # Method: from non-bar-line dark pixels (±2 rows vertical tolerance for
+    # curved objects), propagate rightward through consecutive dark bar-line
+    # columns → left_reach. Similarly leftward → right_reach. Crossing pixels
+    # are those reachable from both directions.
+    barline_cols_2d = np.zeros((h_px, w_px), dtype=bool)
+    barline_cols_2d[:, barline_cols] = True
+
+    # Vertically expand non-bar-line dark pixels to tolerate curves
+    dark_nb_exp = ndimage.binary_dilation(
+        dark_nb, structure=np.ones((5, 1), dtype=np.int32)
+    )
+
+    # left_reach: bar-line pixels reachable by stepping RIGHT from non-BL content
+    left_reach = np.zeros((h_px, w_px), dtype=bool)
+    _seed = np.zeros((h_px, w_px), dtype=bool)
+    _seed[:, 1:] = dark_nb_exp[:, :-1]
+    left_reach |= _seed & dark_mask & barline_cols_2d
+    for _ in range(6):
+        _step = np.zeros((h_px, w_px), dtype=bool)
+        _step[:, 1:] = left_reach[:, :-1]
+        _new = _step & dark_mask & barline_cols_2d & ~left_reach
+        if not _new.any():
+            break
+        left_reach |= _new
+
+    # right_reach: bar-line pixels reachable by stepping LEFT from non-BL content
+    right_reach = np.zeros((h_px, w_px), dtype=bool)
+    _seed = np.zeros((h_px, w_px), dtype=bool)
+    _seed[:, :-1] = dark_nb_exp[:, 1:]
+    right_reach |= _seed & dark_mask & barline_cols_2d
+    for _ in range(6):
+        _step = np.zeros((h_px, w_px), dtype=bool)
+        _step[:, :-1] = right_reach[:, 1:]
+        _new = _step & dark_mask & barline_cols_2d & ~right_reach
+        if not _new.any():
+            break
+        right_reach |= _new
+
+    # crossing_bl: bar-line pixels with non-BL dark content on BOTH sides
+    crossing_bl = dark_mask & barline_cols_2d & left_reach & right_reach
+
     # ── 2. Stave groups ───────────────────────────────────────────────────────
     stave_groups = _detect_stave_groups(dark_nb, n_parts)
 
@@ -352,6 +398,13 @@ def compute_part_data(
         bl_mask              = np.zeros((h_px, w_px), dtype=bool)
         bl_mask[bl_y0:bl_y1, barline_cols] = dark_mask[bl_y0:bl_y1, barline_cols]
         mask_i = mask_i | bl_mask
+
+        # Crossing bar-line pixels in this part's y-range (slurs, crescendos etc.
+        # that pass through the bar line outside the stave span must not be broken)
+        cross_i = crossing_bl.copy()
+        if y_tops[i] > 0:    cross_i[:y_tops[i], :] = False
+        if y_bots[i] < h_px: cross_i[y_bots[i]:,  :] = False
+        mask_i = mask_i | cross_i
 
         # Dilate 1 px to include antialiased ink edges, then restrict to
         # pixels that are actually non-white (avoids pulling in background noise).
