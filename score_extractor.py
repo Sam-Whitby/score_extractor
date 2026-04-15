@@ -108,22 +108,63 @@ def find_content_bounds_2d(page: fitz.Page, clip: fitz.Rect, dpi: int):
 
     Returns (x_left, y_top, x_right, y_bottom) in PDF points.
     Falls back to the original clip bounds if the region is entirely white.
+
+    Top/bottom trimming: strict — a row is white if every pixel >= WHITE_THRESHOLD.
+
+    Left/right trimming: robust two-stage approach to handle 1-pixel grey borders
+    (e.g. scan-line artefacts) that would defeat a strict per-column check:
+
+      Stage 1 — coarse cut using lenient column whiteness (>=98% of pixels white):
+        • Find the largest "white" column run in the left third  → x_left_cut
+        • Find the largest "white" column run in the right third → x_right_cut
+        Cuts are placed at the centres of those runs, so we land squarely inside
+        the whitespace rather than at its boundary.
+
+      Stage 2 — fine trim: within [x_left_cut, x_right_cut] apply a strict
+        all-white column check to remove any residual whitespace at both edges.
     """
     img = _render_gray_clip(page, clip, dpi)
-    row_is_white = np.all(img >= WHITE_THRESHOLD, axis=1)
-    col_is_white = np.all(img >= WHITE_THRESHOLD, axis=0)
-
-    content_rows = np.where(~row_is_white)[0]
-    content_cols = np.where(~col_is_white)[0]
-
-    if len(content_rows) == 0 or len(content_cols) == 0:
-        return clip.x0, clip.y0, clip.x1, clip.y1  # fully white — keep as-is
-
+    h_px, w_px = img.shape
     scale = 72.0 / dpi
-    y_top    = clip.y0 + int(content_rows[0])       * scale
+
+    # ── Top / bottom (rows) — strict ──────────────────────────────────────────
+    row_is_white  = np.all(img >= WHITE_THRESHOLD, axis=1)
+    content_rows  = np.where(~row_is_white)[0]
+
+    if len(content_rows) == 0:
+        return clip.x0, clip.y0, clip.x1, clip.y1  # entirely white
+
+    y_top    = clip.y0 + int(content_rows[0])        * scale
     y_bottom = clip.y0 + (int(content_rows[-1]) + 1) * scale
-    x_left   = clip.x0 + int(content_cols[0])       * scale
-    x_right  = clip.x0 + (int(content_cols[-1]) + 1) * scale
+
+    # ── Left / right (columns) — robust two-stage ─────────────────────────────
+    # Lenient: a column is "white" if ≥98 % of its pixels are white.
+    # This tolerates the single grey border pixel that breaks np.all().
+    col_white_frac = np.mean(img >= WHITE_THRESHOLD, axis=0)  # shape (w_px,)
+    col_is_white_lenient = col_white_frac >= 0.98
+
+    # Stage 1 — coarse cuts from the largest white run in each outer third
+    left_third  = max(1, w_px // 3)
+    right_third = w_px - left_third
+
+    ls, le = _longest_white_run(col_is_white_lenient, 0,           left_third)
+    rs, re = _longest_white_run(col_is_white_lenient, right_third, w_px)
+
+    x_left_px  = (ls + le) // 2 if ls is not None else 0
+    x_right_px = (rs + re) // 2 if rs is not None else w_px
+
+    # Stage 2 — fine trim: strict all-white check within the coarse bounds
+    if x_left_px < x_right_px:
+        inner           = img[:, x_left_px:x_right_px]
+        inner_col_white = np.all(inner >= WHITE_THRESHOLD, axis=0)
+        inner_content   = np.where(~inner_col_white)[0]
+        if len(inner_content) > 0:
+            coarse_left = x_left_px
+            x_left_px   = coarse_left + int(inner_content[0])
+            x_right_px  = coarse_left + int(inner_content[-1]) + 1
+
+    x_left  = clip.x0 + x_left_px  * scale
+    x_right = clip.x0 + x_right_px * scale
 
     return x_left, y_top, x_right, y_bottom
 
