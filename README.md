@@ -12,12 +12,14 @@ Given a 30-page PDF with 4 parts stacked on each page, the tool produces 4 outpu
 
 | Output file | Content |
 |---|---|
-| `score_part1_of_4.pdf` | Top quarter of every page |
-| `score_part2_of_4.pdf` | Second quarter of every page |
-| `score_part3_of_4.pdf` | Third quarter of every page |
-| `score_part4_of_4.pdf` | Bottom quarter of every page |
+| `score_part1_of_4.pdf` | Top strip of every page, assembled onto A4 pages |
+| `score_part2_of_4.pdf` | Second strip of every page, assembled onto A4 pages |
+| `score_part3_of_4.pdf` | Third strip of every page, assembled onto A4 pages |
+| `score_part4_of_4.pdf` | Bottom strip of every page, assembled onto A4 pages |
 
-Slicing is done at the PDF vector level using [PyMuPDF](https://pymupdf.readthedocs.io/), so the output is sharp at any zoom — no rasterisation.
+Each strip is scaled to the **full width of A4 portrait** with the aspect ratio preserved (no stretching). Strips are stacked top-to-bottom sequentially, so a performer can read straight through without jumping around. If a strip does not fit in the remaining space on a page, the rest is left as whitespace and the strip begins on a fresh page.
+
+All slicing is done at the PDF vector level using [PyMuPDF](https://pymupdf.readthedocs.io/) — no rasterisation, so output is sharp at any zoom.
 
 ---
 
@@ -61,6 +63,8 @@ python split_score.py duet.pdf 2 -o ~/Desktop/duet_parts/
 
 ## Notes
 
-- The slices are **equal-height** divisions of each page. If the staves aren't evenly distributed, you may need to crop or adjust the source PDF manually first.
+- Slices are **equal-height** divisions of each page. If the staves aren't evenly distributed between parts, you may need to crop or adjust the source PDF manually first.
+- Output pages are **A4 portrait**. Each slice is scaled to fill the full page width, so the height of each strip on the output page depends on its original proportions.
+- If a single slice is taller than a full A4 page after scaling (unusual), it is clamped to fit.
 - Output files are named `<input_stem>_part<N>_of_<total>.pdf`.
 - Tested with IMSLP-format PDFs (A4 and letter).
