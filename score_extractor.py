@@ -140,14 +140,15 @@ def find_content_bounds_2d(page: fitz.Page, clip: fitz.Rect, dpi: int):
 
 def _detect_barline_columns(dark_mask: np.ndarray) -> np.ndarray:
     """
-    Boolean (w_px,) mask of bar-line columns.
+    Boolean (w_px,) mask of candidate bar-line columns.
 
     Criterion: span (topmost→bottommost dark pixel) > 30% of image height
     AND density (dark pixels / span) > 0.40.
 
     This distinguishes bar lines (span ≈ 100%, density ≈ 0.85) from stave-line
     columns (span ≈ 100% but density ≈ 0.02 — only 5×N sparse rows are dark)
-    and note stems (span < 30%).
+    and most note stems (span < 30%).  A second-pass verification against stave
+    positions is required to reject stems from multiple aligned parts.
     """
     h_px         = dark_mask.shape[0]
     dark_count   = dark_mask.sum(axis=0).astype(np.float32)
@@ -157,6 +158,59 @@ def _detect_barline_columns(dark_mask: np.ndarray) -> np.ndarray:
     span         = np.where(col_has_dark, (last_dark - first_dark + 1).astype(np.float32), 1.0)
     density      = dark_count / span
     return (span > h_px * 0.30) & (density > 0.40)
+
+
+def _verify_barline_columns(
+    barline_cols_candidate: np.ndarray,
+    dark_mask: np.ndarray,
+    stave_groups: list,
+) -> np.ndarray:
+    """
+    Filter candidate bar-line columns to those that are dark at EVERY stave
+    line position AND dark in the gap between every pair of adjacent stave
+    groups (all with a ±3 px tolerance window).
+
+    True bar lines are continuous through the entire system; note stems have
+    breaks in the inter-stave gaps, so they fail the gap check even when
+    multiple aligned stems coincidentally pass the initial density criterion.
+    """
+    h_px     = dark_mask.shape[0]
+    verified = barline_cols_candidate.copy()
+
+    # Must be dark at every individual stave line
+    for group in stave_groups:
+        for y_line in group:
+            y_lo = max(0, y_line - 3)
+            y_hi = min(h_px, y_line + 4)
+            verified = verified & dark_mask[y_lo:y_hi, :].any(axis=0)
+
+    # Must be dark at the midpoint of every inter-part gap
+    for i in range(len(stave_groups) - 1):
+        gap_mid = (stave_groups[i][-1] + stave_groups[i + 1][0]) // 2
+        y_lo = max(0, gap_mid - 3)
+        y_hi = min(h_px, gap_mid + 4)
+        if y_lo < y_hi:
+            verified = verified & dark_mask[y_lo:y_hi, :].any(axis=0)
+
+    return verified
+
+
+def _group_barline_cols(barline_cols: np.ndarray) -> list:
+    """
+    Group consecutive True entries in barline_cols into (start_col, end_col)
+    inclusive pairs, one per physical bar line.
+    """
+    groups = []
+    start  = None
+    for c, is_bl in enumerate(barline_cols.tolist()):
+        if is_bl and start is None:
+            start = c
+        elif not is_bl and start is not None:
+            groups.append((start, c - 1))
+            start = None
+    if start is not None:
+        groups.append((start, len(barline_cols) - 1))
+    return groups
 
 
 def _detect_stave_groups(dark_no_barlines: np.ndarray, n_parts: int) -> list:
@@ -239,33 +293,42 @@ def compute_part_data(
 
     Raises ValueError if stave detection fails.
     """
-    img      = _render_gray_clip(page, clip, dpi)
+    img        = _render_gray_clip(page, clip, dpi)
     h_px, w_px = img.shape
     dark_mask  = img < DARK_THRESHOLD
 
-    # ── 1. Bar lines ──────────────────────────────────────────────────────────
-    barline_cols    = _detect_barline_columns(dark_mask)
-    dark_nb         = dark_mask.copy()
+    # ── 1. Initial bar-line detection ─────────────────────────────────────────
+    barline_cols = _detect_barline_columns(dark_mask)
+    dark_nb      = dark_mask.copy()
     dark_nb[:, barline_cols] = False
 
-    # ── 1a. Crossing bar-line pixels ──────────────────────────────────────────
+    # ── 2. Stave groups (using initial bar-line mask) ─────────────────────────
+    stave_groups = _detect_stave_groups(dark_nb, n_parts)
+
+    # ── 2a. Verify bar-line columns ───────────────────────────────────────────
+    # Reject false positives (e.g. note stems from multiple aligned parts) by
+    # requiring each candidate to be dark at every stave line AND in every
+    # inter-part gap.  Recompute dark_nb with the verified set.
+    barline_cols = _verify_barline_columns(barline_cols, dark_mask, stave_groups)
+    dark_nb      = dark_mask.copy()
+    dark_nb[:, barline_cols] = False
+
+    # ── 2b. Crossing bar-line pixels ─────────────────────────────────────────
     # Pixels in bar-line columns that belong to objects crossing the bar line
     # (slurs, crescendos, ties) have non-bar-line dark content on BOTH sides.
-    # We must not white these out — they must remain continuous in the output.
+    # These must not be whited out — they must remain continuous in the output.
     #
-    # Method: from non-bar-line dark pixels (±2 rows vertical tolerance for
-    # curved objects), propagate rightward through consecutive dark bar-line
-    # columns → left_reach. Similarly leftward → right_reach. Crossing pixels
-    # are those reachable from both directions.
+    # From non-bar-line dark pixels (±3 rows vertical tolerance for curved
+    # objects), propagate rightward through consecutive dark bar-line columns
+    # → left_reach; similarly leftward → right_reach.  Pixels reachable from
+    # both directions are true crossing pixels.
     barline_cols_2d = np.zeros((h_px, w_px), dtype=bool)
     barline_cols_2d[:, barline_cols] = True
 
-    # Vertically expand non-bar-line dark pixels to tolerate curves
     dark_nb_exp = ndimage.binary_dilation(
-        dark_nb, structure=np.ones((5, 1), dtype=np.int32)
+        dark_nb, structure=np.ones((7, 1), dtype=np.int32)   # ±3 row tolerance
     )
 
-    # left_reach: bar-line pixels reachable by stepping RIGHT from non-BL content
     left_reach = np.zeros((h_px, w_px), dtype=bool)
     _seed = np.zeros((h_px, w_px), dtype=bool)
     _seed[:, 1:] = dark_nb_exp[:, :-1]
@@ -278,7 +341,6 @@ def compute_part_data(
             break
         left_reach |= _new
 
-    # right_reach: bar-line pixels reachable by stepping LEFT from non-BL content
     right_reach = np.zeros((h_px, w_px), dtype=bool)
     _seed = np.zeros((h_px, w_px), dtype=bool)
     _seed[:, :-1] = dark_nb_exp[:, 1:]
@@ -291,11 +353,7 @@ def compute_part_data(
             break
         right_reach |= _new
 
-    # crossing_bl: bar-line pixels with non-BL dark content on BOTH sides
     crossing_bl = dark_mask & barline_cols_2d & left_reach & right_reach
-
-    # ── 2. Stave groups ───────────────────────────────────────────────────────
-    stave_groups = _detect_stave_groups(dark_nb, n_parts)
 
     # ── 3. Connected components ───────────────────────────────────────────────
     labeled, _ = ndimage.label(dark_nb, structure=_CC_STRUCTURE)
@@ -413,7 +471,8 @@ def compute_part_data(
 
         part_masks.append(mask_i)
 
-    return part_masks, img
+    barline_groups = _group_barline_cols(barline_cols)
+    return part_masks, img, barline_groups, stave_groups
 
 
 # ── Sub-page clip builder (Step 1 output) ─────────────────────────────────────
@@ -488,44 +547,60 @@ def extract_parts(
     curr_ys       = [0.0] * n_parts
     last_hs       = [0.0] * n_parts
 
+    # Bar numbering state.
+    # bar_number = the number written above the FIRST bar-line of the current
+    # sub-page (= the number of the bar that starts after that bar-line).
+    # For part 0 that first barline is already labelled in the printed score, so
+    # we skip it; all other parts receive the label.
+    #
+    # After a sub-page with K bar-line groups the last bar (started at barline K)
+    # continues into the next sub-page, so bar_number advances by K-1.
+    bar_number   = 1
+    BAR_FONTSIZE = 5.5   # pt — small enough to be unobtrusive
+
     for sp_idx, (page_num, clip) in enumerate(sub_pages):
         print(f"  Processing sub-page {sp_idx + 1}/{len(sub_pages)} "
               f"(source page {page_num + 1})…", end="", flush=True)
 
         try:
-            part_masks, img = compute_part_data(doc[page_num], clip, n_parts, dpi)
+            part_masks, img, barline_groups, _ = compute_part_data(
+                doc[page_num], clip, n_parts, dpi
+            )
             print(" stave detection OK")
         except ValueError as exc:
             print(f" WARNING: {exc} — using equal split fallback.")
-            # Fallback: render the image and split equally
-            img = _render_gray_clip(doc[page_num], clip, dpi)
-            h_px = img.shape[0]
+            img   = _render_gray_clip(doc[page_num], clip, dpi)
+            h_px  = img.shape[0]
             equal_masks = []
             for i in range(n_parts):
-                m = np.zeros(img.shape, dtype=bool)
+                m  = np.zeros(img.shape, dtype=bool)
                 r0 = int(i / n_parts * h_px)
                 r1 = int((i + 1) / n_parts * h_px)
                 m[r0:r1, :] = img[r0:r1, :] < WHITE_THRESHOLD
                 equal_masks.append(m)
-            part_masks = equal_masks
+            part_masks     = equal_masks
+            barline_groups = _group_barline_cols(
+                _detect_barline_columns(img < DARK_THRESHOLD)
+            )
 
-        scale = content_w / clip.width  # source → A4 content width (PDF pts)
+        w_px  = img.shape[1]
+        scale = content_w / clip.width  # source-image → A4 content width
 
         for part_idx in range(n_parts):
             # ── Apply mask to source image ────────────────────────────────────
             img_part = np.full_like(img, 255)
-            mask = part_masks[part_idx]
+            mask     = part_masks[part_idx]
             img_part[mask] = img[mask]
 
             # ── Tight crop to non-white rows ──────────────────────────────────
             dark_rows = np.where((img_part < WHITE_THRESHOLD).any(axis=1))[0]
             if len(dark_rows) == 0:
                 continue
-            r0, r1   = int(dark_rows[0]), int(dark_rows[-1])
-            cropped  = img_part[r0: r1 + 1, :]
+            r0, r1  = int(dark_rows[0]), int(dark_rows[-1])
+            cropped = img_part[r0: r1 + 1, :]
 
             # ── Scaled height on A4 (preserving aspect ratio) ─────────────────
-            h_pt     = cropped.shape[0] * (72.0 / dpi)  # natural PDF height
+            h_pt     = cropped.shape[0] * (72.0 / dpi)
             scaled_h = min(h_pt * scale, content_h)
             if scaled_h <= 0:
                 continue
@@ -546,8 +621,38 @@ def extract_parts(
                 margin + curr_ys[part_idx] + scaled_h,
             )
             curr_pages[part_idx].insert_image(dest, pixmap=_numpy_to_pixmap(cropped))
+
+            # ── Bar numbers above each bar-line ───────────────────────────────
+            # Each bar-line group maps to a sequential bar number.
+            # The FIRST bar-line of every sub-page is the system-opening barline;
+            # the printed score already shows this number for part 0, so we skip
+            # it there.  All other parts and all subsequent bar-lines are labelled.
+            for bl_idx, (bl_start, bl_end) in enumerate(barline_groups):
+                if part_idx == 0 and bl_idx == 0:
+                    continue   # already in the printed score for the top part
+
+                bar_num  = bar_number + bl_idx
+                bl_cx    = (bl_start + bl_end) / 2.0           # centre col (pixels)
+                x_pdf    = dest.x0 + bl_cx / w_px * content_w  # PDF x coordinate
+                # Approximate centering: shift left by ~half the text width
+                x_pdf   -= len(str(bar_num)) * BAR_FONTSIZE * 0.28
+                # Baseline sits just inside the top of the section
+                y_pdf    = dest.y0 + BAR_FONTSIZE + 1.5
+
+                curr_pages[part_idx].insert_text(
+                    (x_pdf, y_pdf),
+                    str(bar_num),
+                    fontsize=BAR_FONTSIZE,
+                    color=(0.35, 0.35, 0.35),   # dark grey — unobtrusive
+                )
+
             curr_ys[part_idx] += scaled_h
             last_hs[part_idx]  = scaled_h
+
+        # Advance bar counter: K barlines → last barline starts bar (bar_number+K-1)
+        # which continues into the next sub-page, so advance by K-1.
+        if barline_groups:
+            bar_number += len(barline_groups) - 1
 
     # ── Save output documents ──────────────────────────────────────────────────
     print()
