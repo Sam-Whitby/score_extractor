@@ -16,22 +16,30 @@ Left/right trimming uses a two-stage approach: a lenient column-whiteness test (
 
 For each sub-page:
 
-1. **Bar-line detection** — columns where the vertical span of dark pixels covers >30% of the image height *and* the pixel density within that span is >40% are classified as bar lines. This density criterion distinguishes bar lines (nearly solid ink, density ≈ 0.85) from stave-line columns (only ~20 sparse rows dark across the full height, density ≈ 0.02). Detected bar lines are temporarily masked out so they do not bridge parts during connectivity analysis.
+1. **Bar-line detection** — columns where the vertical span of dark pixels covers >30% of the image height *and* the pixel density within that span is >40% are classified as candidate bar lines. Stave-line columns have the same span but far lower density (~0.02), so they are excluded.
 
-2. **Stave detection** — after masking bar lines, rows with above-threshold darkness form peaks corresponding to the 5×N stave lines. The N×5 peaks with the highest row-darkness are kept and grouped into N sets of 5 by identifying the N−1 largest consecutive gaps between sorted line positions.
+2. **Verification against stave positions** — candidates are checked to be dark at every stave line position and at the midpoint of every inter-stave gap. Note stems — which can align across multiple parts but break at stave gaps — are rejected here.
 
-3. **Flood-fill** — connected components (8-connectivity, so diagonal beams are followed) are labelled on the bar-line-masked image. Each component is classified by which stave group(s) it touches:
+3. **System bracket removal** — the ornate vertical bracket at the far left of each system (connecting all parts) passes the bar-line criteria but is conspicuously wider than real bar lines. It is detected as the leftmost barline group whose width is more than twice the median barline width, then removed: its columns are whited out in the source image so it never appears in any part output.
+
+4. **Stave detection** — after masking bar lines, rows with above-threshold darkness form peaks corresponding to the 5×N stave lines. The N×5 peaks with the highest row-darkness are kept and grouped into N sets of 5 by identifying the N−1 largest consecutive gaps between sorted line positions.
+
+5. **Flood-fill** — connected components (8-connectivity, so diagonal beams are followed) are labelled on the bar-line-masked image. Each component is classified by which stave group(s) it touches:
    - *Single-part*: touches only one stave group → assigned fully to that part (full extent retained).
-   - *Shared*: touches multiple stave groups → clipped at the midpoint between the adjacent stave groups, so each part receives only its portion.
-   - *Satellite*: touches no stave (slurs, dynamics, text) → assigned to the part whose connected-content bounding box is nearest in 2-D Euclidean distance, and included as its full connected component.
+   - *Shared*: touches multiple stave groups → clipped at the midpoint between adjacent stave groups.
+   - *Satellite*: touches no stave (slurs, dynamics, text) → assigned to the part whose connected-content bounding box is nearest in 2-D Euclidean distance, included as its full connected component.
 
-4. **Bar-line trimming** — bar-line pixels are added back to each part's mask, but only within that part's stave y-span (±2 px buffer). This removes the bar lines above the top stave and below the bottom stave of each part, matching the appearance of conventionally extracted parts.
+6. **Bar-line trimming** — bar-line pixels are added back to each part's mask only within that part's stave y-span (±2 px buffer). This removes bar lines above and below each part's own staves.
 
-5. **Antialiasing** — the mask is dilated by 1 pixel and intersected with non-white pixels to include antialiased ink edges without pulling in background noise.
+7. **Crossing object preservation** — pixels in bar-line columns that have non-bar-line dark content on both sides (slurs, crescendos, ties that cross a bar line) are identified by bilateral propagation and preserved in the owning part's mask, so crossing objects appear continuous rather than interrupted.
 
-### Step 3 — A4 assembly
+8. **Antialiasing** — the mask is dilated by 1 pixel and intersected with non-white pixels to include antialiased ink edges.
 
-For each part, the sub-page image is rendered at the analysis DPI, the per-part mask is applied (non-part pixels set to white), and the result is cropped to a tight bounding box. Because satellites may extend above or below the main stave body, the crop is a rectangle that includes the satellite content with white space around it — so each section has flat rectangular edges. Sections are then scaled to fill the full printable width of A4 (aspect ratio preserved) and stacked with a configurable gap, with page breaks inserted as needed.
+### Step 3 — A4 assembly with equal stave spacing
+
+For each part, all system section images are collected in Phase 1. In Phase 2 they are packed onto A4 pages and positioned with equal whitespace between adjacent staves on each page, producing uniform, professionally-spaced output. Pages are filled greedily (add sections until the next would overflow at minimum 2 pt spacing), then the gap on each page is equalized.
+
+Bar numbers are written in small grey text above each bar line. The closing bar line of each system (which is the same physical bar line as the opening of the next system) is labelled on the next system only, preventing double-counting. The top part (part 1) already has bar numbers printed in the source score at the start of each system, so these are omitted there.
 
 ---
 
@@ -53,7 +61,6 @@ python score_extractor.py <input.pdf> --parts N [options]
 |---|---|---|
 | `-n` / `--parts N` | *(required)* | Number of instrument parts per system |
 | `-p` / `--systems P` | `1` | Systems stacked per source page (triggers Step 1 splitting) |
-| `-g` / `--gap FRAC` | `1.0` | Gap between sections as a fraction of the preceding section's height |
 | `-m` / `--margin MM` | `15` | Printer-safe margin in mm on all four sides of each A4 page |
 | `-o` / `--output-dir DIR` | `<stem>_parts/` | Output directory |
 | `--dpi DPI` | `150` | Rendering resolution — controls both analysis accuracy and output image quality |
@@ -66,8 +73,8 @@ python score_extractor.py <input.pdf> --parts N [options]
 # 4-part score, one system per page
 python score_extractor.py quartet.pdf --parts 4
 
-# 4-part score, two systems per page, compact gap, higher quality
-python score_extractor.py quartet.pdf --parts 4 --systems 2 --gap 0.3 --dpi 200
+# 4-part score, two systems per page, higher quality
+python score_extractor.py quartet.pdf --parts 4 --systems 2 --dpi 200
 
 # Write to a specific directory
 python score_extractor.py quartet.pdf --parts 4 --systems 2 -o ~/Desktop/parts/

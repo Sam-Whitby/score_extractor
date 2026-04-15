@@ -213,6 +213,39 @@ def _group_barline_cols(barline_cols: np.ndarray) -> list:
     return groups
 
 
+def _remove_system_bracket(
+    barline_cols: np.ndarray,
+    barline_groups: list,
+    w_px: int,
+) -> tuple:
+    """
+    Detect and remove the ornate system bracket at the far left of each system.
+
+    The bracket is a thick connected vertical line (typically 4-20 px wide) that
+    appears before the first thin barline and within the leftmost 15% of the image.
+    Regular barlines are 1-2 px wide; the bracket is conspicuously wider.
+
+    Returns (updated_barline_cols, bracket_cols_range) where bracket_cols_range
+    is (c_start, c_end) inclusive, or None if no bracket was found.
+    """
+    if not barline_groups:
+        return barline_cols, None
+
+    widths    = [end - start + 1 for start, end in barline_groups]
+    median_w  = float(np.median(widths)) if len(widths) >= 3 else 1.0
+    first     = barline_groups[0]
+    first_w   = first[1] - first[0] + 1
+    first_pos = first[0] / w_px
+
+    # Bracket is significantly wider than typical barlines and near the left edge
+    if first_w > max(3, median_w * 2.0) and first_pos < 0.15:
+        updated = barline_cols.copy()
+        updated[first[0]: first[1] + 1] = False
+        return updated, first
+
+    return barline_cols, None
+
+
 def _detect_stave_groups(dark_no_barlines: np.ndarray, n_parts: int) -> list:
     """
     Find the y-pixel positions of all 5×n_parts stave lines, grouped into n_parts
@@ -308,12 +341,25 @@ def compute_part_data(
     # ── 2a. Verify bar-line columns ───────────────────────────────────────────
     # Reject false positives (e.g. note stems from multiple aligned parts) by
     # requiring each candidate to be dark at every stave line AND in every
-    # inter-part gap.  Recompute dark_nb with the verified set.
+    # inter-part gap.
     barline_cols = _verify_barline_columns(barline_cols, dark_mask, stave_groups)
-    dark_nb      = dark_mask.copy()
+
+    # ── 2b. Remove system bracket ─────────────────────────────────────────────
+    # The ornate vertical bracket at the far left of each system connects all
+    # parts.  It passes verification (it is continuous through all staves and
+    # gaps) but is much wider than a real barline.  Remove it from the analysis
+    # and white it out in the source image so it never appears in any part.
+    _pre_groups  = _group_barline_cols(barline_cols)
+    barline_cols, bracket_range = _remove_system_bracket(barline_cols, _pre_groups, w_px)
+    if bracket_range is not None:
+        c0, c1 = bracket_range
+        img[:, c0: c1 + 1]       = 255
+        dark_mask[:, c0: c1 + 1] = False
+
+    dark_nb = dark_mask.copy()
     dark_nb[:, barline_cols] = False
 
-    # ── 2b. Crossing bar-line pixels ─────────────────────────────────────────
+    # ── 2c. Crossing bar-line pixels ─────────────────────────────────────────
     # Pixels in bar-line columns that belong to objects crossing the bar line
     # (slurs, crescendos, ties) have non-bar-line dark content on BOTH sides.
     # These must not be whited out — they must remain continuous in the output.
@@ -500,20 +546,69 @@ def build_sub_page_clips(doc: fitz.Document, p_sub: int, dpi: int) -> list:
     return sub_pages
 
 
-# ── Main pipeline ──────────────────────────────────────────────────────────────
+
+# ── Bar-number annotation helper ──────────────────────────────────────────────
+
+BAR_FONTSIZE = 5.5   # pt — small, unobtrusive
+
+
+def _annotate_bar_numbers(
+    page: fitz.Page,
+    dest: fitz.Rect,
+    barline_groups: list,
+    bar_start: int,
+    part_idx: int,
+    w_px: int,
+    content_w: float,
+):
+    """
+    Write small grey bar numbers above each internal bar-line in this section.
+
+    Skips:
+      • The LAST barline of every section — it is the same physical barline as the
+        FIRST of the next system, which will be labelled there instead.
+      • The FIRST barline of part 0 on every section — the printed score already
+        shows this number at the beginning of each system for the top part.
+    """
+    n = len(barline_groups)
+    for bl_idx, (bl_start, bl_end) in enumerate(barline_groups):
+        if bl_idx == n - 1:
+            continue   # closing barline → will be the opening of the next system
+        if part_idx == 0 and bl_idx == 0:
+            continue   # top part already has this number printed in the score
+
+        bar_num = bar_start + bl_idx
+        bl_cx   = (bl_start + bl_end) / 2.0
+        x_pdf   = dest.x0 + bl_cx / w_px * content_w
+        x_pdf  -= len(str(bar_num)) * BAR_FONTSIZE * 0.28   # approximate centering
+        y_pdf   = dest.y0 + BAR_FONTSIZE + 1.5
+
+        page.insert_text(
+            (x_pdf, y_pdf),
+            str(bar_num),
+            fontsize=BAR_FONTSIZE,
+            color=(0.35, 0.35, 0.35),
+        )
+
+
+# ── Main pipeline ──────────────────────────────────────────────────────────────────────────────
 
 def extract_parts(
     input_pdf: str,
     n_parts: int,
     p_sub: int = 1,
-    gap_fraction: float = DEFAULT_GAP,
     margin_mm: float = DEFAULT_MARGIN_MM,
     output_dir: str = None,
     dpi: int = DEFAULT_DPI,
 ):
     """
     Full pipeline: system-split → stave-connectivity part detection →
-    mask-based rendering → A4 assembly.
+    mask-based rendering → equal-spacing A4 assembly.
+
+    Two phases:
+      Phase 1 — collect all per-part section images and bar-number metadata.
+      Phase 2 — pack sections onto A4 pages (greedy, minimum 2 pt gap) and
+                distribute with equal whitespace between staves on each page.
     """
     doc = fitz.open(input_pdf)
     if len(doc) == 0:
@@ -526,37 +621,24 @@ def extract_parts(
     margin    = margin_mm * MM_TO_PT
     content_w = A4_W - 2 * margin
     content_h = A4_H - 2 * margin
+    MIN_GAP   = 2.0   # pt — minimum whitespace between sections on a page
 
     print(f"Input:         {input_pdf}  ({len(doc)} pages)")
     print(f"Systems/page:  {p_sub}")
     print(f"Parts:         {n_parts}")
-    print(f"Gap fraction:  {gap_fraction}")
     print(f"Print margin:  {margin_mm} mm ({margin:.1f} pt)")
     print(f"Analysis DPI:  {dpi}")
     print(f"Output dir:    {output_dir}/\n")
 
-    sub_pages = build_sub_page_clips(doc, p_sub, dpi)
+    sub_pages  = build_sub_page_clips(doc, p_sub, dpi)
     print(f"Sub-pages after preprocessing: {len(sub_pages)}\n")
 
     input_stem = Path(input_pdf).stem
 
-    # Open one output document per part up front so we can write all parts
-    # while processing each sub-page only once.
-    out_docs      = [fitz.open()                            for _ in range(n_parts)]
-    curr_pages    = [d.new_page(width=A4_W, height=A4_H)   for d in out_docs]
-    curr_ys       = [0.0] * n_parts
-    last_hs       = [0.0] * n_parts
-
-    # Bar numbering state.
-    # bar_number = the number written above the FIRST bar-line of the current
-    # sub-page (= the number of the bar that starts after that bar-line).
-    # For part 0 that first barline is already labelled in the printed score, so
-    # we skip it; all other parts receive the label.
-    #
-    # After a sub-page with K bar-line groups the last bar (started at barline K)
-    # continues into the next sub-page, so bar_number advances by K-1.
-    bar_number   = 1
-    BAR_FONTSIZE = 5.5   # pt — small enough to be unobtrusive
+    # ── Phase 1: collect sections ──────────────────────────────────────────────────────────
+    # Each section dict: 'cropped', 'scaled_h', 'w_px', 'barline_groups', 'bar_start'
+    all_sections: list = [[] for _ in range(n_parts)]
+    bar_number = 1
 
     for sp_idx, (page_num, clip) in enumerate(sub_pages):
         print(f"  Processing sub-page {sp_idx + 1}/{len(sub_pages)} "
@@ -579,95 +661,101 @@ def extract_parts(
                 m[r0:r1, :] = img[r0:r1, :] < WHITE_THRESHOLD
                 equal_masks.append(m)
             part_masks     = equal_masks
-            barline_groups = _group_barline_cols(
-                _detect_barline_columns(img < DARK_THRESHOLD)
-            )
+            barline_groups = []   # no reliable bar info in fallback
 
         w_px  = img.shape[1]
-        scale = content_w / clip.width  # source-image → A4 content width
+        scale = content_w / clip.width
 
         for part_idx in range(n_parts):
-            # ── Apply mask to source image ────────────────────────────────────
             img_part = np.full_like(img, 255)
             mask     = part_masks[part_idx]
             img_part[mask] = img[mask]
 
-            # ── Tight crop to non-white rows ──────────────────────────────────
             dark_rows = np.where((img_part < WHITE_THRESHOLD).any(axis=1))[0]
             if len(dark_rows) == 0:
                 continue
             r0, r1  = int(dark_rows[0]), int(dark_rows[-1])
             cropped = img_part[r0: r1 + 1, :]
 
-            # ── Scaled height on A4 (preserving aspect ratio) ─────────────────
             h_pt     = cropped.shape[0] * (72.0 / dpi)
             scaled_h = min(h_pt * scale, content_h)
             if scaled_h <= 0:
                 continue
 
-            # ── Gap + page-overflow check ─────────────────────────────────────
-            gap = gap_fraction * last_hs[part_idx]
-            if last_hs[part_idx] > 0 and curr_ys[part_idx] + gap + scaled_h > content_h:
-                curr_pages[part_idx] = out_docs[part_idx].new_page(width=A4_W, height=A4_H)
-                curr_ys[part_idx]    = 0.0
-                gap                  = 0.0
-            curr_ys[part_idx] += gap
+            all_sections[part_idx].append({
+                'cropped':        cropped,
+                'scaled_h':       scaled_h,
+                'w_px':           w_px,
+                'barline_groups': barline_groups,
+                'bar_start':      bar_number,
+            })
 
-            # ── Place image on A4 ─────────────────────────────────────────────
-            dest = fitz.Rect(
-                margin,
-                margin + curr_ys[part_idx],
-                margin + content_w,
-                margin + curr_ys[part_idx] + scaled_h,
-            )
-            curr_pages[part_idx].insert_image(dest, pixmap=_numpy_to_pixmap(cropped))
-
-            # ── Bar numbers above each bar-line ───────────────────────────────
-            # Each bar-line group maps to a sequential bar number.
-            # The FIRST bar-line of every sub-page is the system-opening barline;
-            # the printed score already shows this number for part 0, so we skip
-            # it there.  All other parts and all subsequent bar-lines are labelled.
-            for bl_idx, (bl_start, bl_end) in enumerate(barline_groups):
-                if part_idx == 0 and bl_idx == 0:
-                    continue   # already in the printed score for the top part
-
-                bar_num  = bar_number + bl_idx
-                bl_cx    = (bl_start + bl_end) / 2.0           # centre col (pixels)
-                x_pdf    = dest.x0 + bl_cx / w_px * content_w  # PDF x coordinate
-                # Approximate centering: shift left by ~half the text width
-                x_pdf   -= len(str(bar_num)) * BAR_FONTSIZE * 0.28
-                # Baseline sits just inside the top of the section
-                y_pdf    = dest.y0 + BAR_FONTSIZE + 1.5
-
-                curr_pages[part_idx].insert_text(
-                    (x_pdf, y_pdf),
-                    str(bar_num),
-                    fontsize=BAR_FONTSIZE,
-                    color=(0.35, 0.35, 0.35),   # dark grey — unobtrusive
-                )
-
-            curr_ys[part_idx] += scaled_h
-            last_hs[part_idx]  = scaled_h
-
-        # Advance bar counter: K barlines → last barline starts bar (bar_number+K-1)
-        # which continues into the next sub-page, so advance by K-1.
+        # The closing barline of this system IS the opening barline of the next,
+        # so bar_number advances by len(barline_groups) - 1.
         if barline_groups:
             bar_number += len(barline_groups) - 1
 
-    # ── Save output documents ──────────────────────────────────────────────────
+    doc.close()
+
+    # ── Phase 2: equal-spacing layout ───────────────────────────────────────────────────────────
     print()
     for part_idx in range(n_parts):
+        sections = all_sections[part_idx]
+        if not sections:
+            continue
+
+        out_doc = fitz.open()
+
+        # Pack sections onto pages greedily (add as many as fit with MIN_GAP).
+        pages: list = []
+        current: list = []
+
+        for sec in sections:
+            n_now  = len(current) + 1
+            total_h = sum(s['scaled_h'] for s in current) + sec['scaled_h']
+            needed  = total_h + (n_now - 1) * MIN_GAP
+            if needed <= content_h or not current:
+                current.append(sec)
+            else:
+                pages.append(current)
+                current = [sec]
+        if current:
+            pages.append(current)
+
+        for pg_secs in pages:
+            page    = out_doc.new_page(width=A4_W, height=A4_H)
+            n_pg    = len(pg_secs)
+            total_h = sum(s['scaled_h'] for s in pg_secs)
+            # Equal whitespace between sections; never below MIN_GAP.
+            gap = (content_h - total_h) / (n_pg - 1) if n_pg > 1 else 0.0
+            gap = max(gap, MIN_GAP)
+
+            y = 0.0
+            for sec in pg_secs:
+                dest = fitz.Rect(
+                    margin,
+                    margin + y,
+                    margin + content_w,
+                    margin + y + sec['scaled_h'],
+                )
+                page.insert_image(dest, pixmap=_numpy_to_pixmap(sec['cropped']))
+                _annotate_bar_numbers(
+                    page, dest,
+                    sec['barline_groups'], sec['bar_start'],
+                    part_idx, sec['w_px'], content_w,
+                )
+                y += sec['scaled_h'] + gap
+
         label    = f"part{part_idx + 1}_of_{n_parts}"
         out_path = os.path.join(output_dir, f"{input_stem}_{label}.pdf")
-        out_docs[part_idx].save(out_path, garbage=4, deflate=True)
-        out_docs[part_idx].close()
-        print(f"  Saved: {out_path}")
+        out_doc.save(out_path, garbage=4, deflate=True)
+        out_doc.close()
+        print(f"  Saved: {out_path}  ({len(pages)} page(s), {len(sections)} system(s))")
 
-    doc.close()
-    print(f"\nDone — {n_parts} parts written to '{output_dir}/'")
+    print(f"\nDone — {n_parts} parts written to '{output_dir}'")
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
+# ── CLI ──────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
@@ -676,7 +764,7 @@ def main():
         epilog=(
             "Examples:\n"
             "  python score_extractor.py quartet.pdf --parts 4\n"
-            "  python score_extractor.py quartet.pdf --parts 4 --systems 2 --gap 0.5\n"
+            "  python score_extractor.py quartet.pdf --parts 4 --systems 2\n"
             "  python score_extractor.py quartet.pdf --parts 4 --systems 2 --dpi 200 -o ~/parts/"
         ),
     )
@@ -685,9 +773,6 @@ def main():
         help="Number of instrument parts to extract (horizontal slices per system).")
     parser.add_argument("-p", "--systems", type=int, default=1, metavar="P",
         help="Systems per page (default 1). >1 triggers horizontal page-splitting at whitespace.")
-    parser.add_argument("-g", "--gap",     type=float, default=DEFAULT_GAP, metavar="FRAC",
-        help=f"Gap between sections as a fraction of the preceding section height "
-             f"(default {DEFAULT_GAP}; 0=none, 1=full section height).")
     parser.add_argument("-m", "--margin",  type=float, default=DEFAULT_MARGIN_MM, metavar="MM",
         help=f"Printer-safe margin in mm on all A4 sides (default {DEFAULT_MARGIN_MM}).")
     parser.add_argument("-o", "--output-dir", metavar="DIR",
@@ -697,21 +782,20 @@ def main():
              "Higher gives better output quality and detection accuracy but is slower.")
 
     args = parser.parse_args()
-    if args.parts   < 2: parser.error("--parts must be ≥ 2.")
-    if args.systems < 1: parser.error("--systems must be ≥ 1.")
-    if args.gap     < 0: parser.error("--gap must be ≥ 0.")
-    if args.margin  < 0: parser.error("--margin must be ≥ 0.")
+    if args.parts   < 2: parser.error("--parts must be >= 2.")
+    if args.systems < 1: parser.error("--systems must be >= 1.")
+    if args.margin  < 0: parser.error("--margin must be >= 0.")
     if not os.path.isfile(args.input): parser.error(f"File not found: {args.input}")
 
     extract_parts(
         input_pdf=args.input,
         n_parts=args.parts,
         p_sub=args.systems,
-        gap_fraction=args.gap,
         margin_mm=args.margin,
         output_dir=args.output_dir,
         dpi=args.dpi,
     )
+
 
 if __name__ == "__main__":
     main()
