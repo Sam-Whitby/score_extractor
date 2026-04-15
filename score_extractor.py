@@ -47,7 +47,7 @@ _CC_STRUCTURE = np.ones((3, 3), dtype=np.int32)
 def _render_gray_clip(page: fitz.Page, clip: fitz.Rect, dpi: int) -> np.ndarray:
     mat = fitz.Matrix(dpi / 72, dpi / 72)
     pix = page.get_pixmap(matrix=mat, clip=clip, colorspace=fitz.csGRAY)
-    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
+    return np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy()
 
 
 def _numpy_to_pixmap(arr: np.ndarray) -> fitz.Pixmap:
